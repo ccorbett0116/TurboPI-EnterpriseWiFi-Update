@@ -171,6 +171,13 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error("Error in disconnect_managed_only: %s" % str(e))
 
+    def enable_autoconnect():
+        """Turn autoconnect on only after the profile is fully configured
+        and verified working, so NetworkManager never races us."""
+        subprocess.run(['nmcli', 'connection', 'modify', MANAGED_STA_CON_NAME,
+                        'connection.autoconnect', 'yes'],
+                       stderr=subprocess.DEVNULL)
+
     def connect_sta_psk(ssid, password):
         """Connect to WPA2-PSK network using nmcli connection add for persistence"""
         logger.info("STA mode: Connecting to '%s' with WPA2-PSK" % ssid)
@@ -179,7 +186,9 @@ if __name__ == "__main__":
         subprocess.run(['nmcli', 'connection', 'delete', MANAGED_STA_CON_NAME],
                        stderr=subprocess.DEVNULL)
 
-        # Create persistent connection
+        # Create the profile with autoconnect DISABLED so NetworkManager
+        # cannot start activating it on its own before we bring it up
+        # ourselves. Autoconnect is enabled only after a successful 'up'.
         result = subprocess.run([
             'nmcli', 'connection', 'add',
             'type', 'wifi',
@@ -188,7 +197,7 @@ if __name__ == "__main__":
             'ssid', ssid,
             'wifi-sec.key-mgmt', 'wpa-psk',
             'wifi-sec.psk', password,
-            'connection.autoconnect', 'yes'
+            'connection.autoconnect', 'no'
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         if result.returncode != 0:
@@ -203,6 +212,7 @@ if __name__ == "__main__":
             logger.error("Failed to activate PSK connection: %s" % result.stderr.decode())
             return False
 
+        enable_autoconnect()
         return True
 
     def connect_sta_eap(ssid, identity, password, anon_identity="", ca_cert="",
@@ -215,23 +225,19 @@ if __name__ == "__main__":
         subprocess.run(['nmcli', 'connection', 'delete', MANAGED_STA_CON_NAME],
                        stderr=subprocess.DEVNULL)
 
-        # Create base connection
-        result = subprocess.run([
+        # Create the profile in a SINGLE nmcli call, fully configured,
+        # with autoconnect DISABLED. The previous add-then-modify approach
+        # left a window where NetworkManager could begin activating a
+        # half-configured (open, no 802.1X) profile whenever the SSID was
+        # in range - i.e. it only misbehaved on campus. Autoconnect is
+        # enabled only after a successful 'up'.
+        add_cmd = [
             'nmcli', 'connection', 'add',
             'type', 'wifi',
             'ifname', 'wlan0',
             'con-name', MANAGED_STA_CON_NAME,
             'ssid', ssid,
-            'connection.autoconnect', 'yes'
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        if result.returncode != 0:
-            logger.error("Failed to create EAP connection: %s" % result.stderr.decode())
-            return False
-
-        # Build modify command for 802.1X settings
-        modify_cmd = [
-            'nmcli', 'connection', 'modify', MANAGED_STA_CON_NAME,
+            'connection.autoconnect', 'no',
             'wifi-sec.key-mgmt', 'wpa-eap',
             '802-1x.eap', eap_method,
             '802-1x.identity', identity,
@@ -241,18 +247,21 @@ if __name__ == "__main__":
 
         # Add optional parameters if provided
         if anon_identity:
-            modify_cmd.extend(['802-1x.anonymous-identity', anon_identity])
+            add_cmd.extend(['802-1x.anonymous-identity', anon_identity])
         if ca_cert and os.path.exists(ca_cert):
-            modify_cmd.extend(['802-1x.ca-cert', ca_cert])
+            add_cmd.extend(['802-1x.ca-cert', ca_cert])
+        elif ca_cert:
+            logger.warning("CA cert configured but not found at %s, "
+                           "connecting without server verification" % ca_cert)
         if domain_suffix_match:
-            modify_cmd.extend(['802-1x.domain-suffix-match', domain_suffix_match])
+            add_cmd.extend(['802-1x.domain-suffix-match', domain_suffix_match])
         if altsubject_match:
-            modify_cmd.extend(['802-1x.altsubject-matches', altsubject_match])
+            add_cmd.extend(['802-1x.altsubject-matches', altsubject_match])
 
-        result = subprocess.run(modify_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = subprocess.run(add_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         if result.returncode != 0:
-            logger.error("Failed to configure EAP settings: %s" % result.stderr.decode())
+            logger.error("Failed to create EAP connection: %s" % result.stderr.decode())
             return False
 
         # Bring up the connection
@@ -263,6 +272,7 @@ if __name__ == "__main__":
             logger.error("Failed to activate EAP connection: %s" % result.stderr.decode())
             return False
 
+        enable_autoconnect()
         return True
 
     def WIFI_MGR():
@@ -317,6 +327,29 @@ if __name__ == "__main__":
         elif WIFI_MODE == 2: #Client/STA
             led_on_time = 5
             led_off_time = 5
+
+            # Idempotency: if our managed connection is already active on
+            # the configured SSID, leave it alone. Without this, every
+            # service (re)start tears down a working connection and
+            # rebuilds it from scratch.
+            try:
+                result = subprocess.run(
+                    ['nmcli', '-t', '-f', 'NAME', 'con', 'show', '--active'],
+                    stdout=subprocess.PIPE)
+                if MANAGED_STA_CON_NAME in result.stdout.decode().split('\n'):
+                    result = subprocess.run(
+                        ['nmcli', '-g', '802-11-wireless.ssid',
+                         'con', 'show', MANAGED_STA_CON_NAME],
+                        stdout=subprocess.PIPE)
+                    if result.stdout.decode().strip() == WIFI_STA_SSID:
+                        msg = "Already connected to %s, nothing to do" % WIFI_STA_SSID
+                        print("*************%s" % msg)
+                        logger.info(msg)
+                        led_on_time = 100
+                        led_off_time = 0
+                        return -1
+            except Exception as e:
+                logger.warning("Idempotency check failed, continuing: %s" % str(e))
 
             # Safe disconnect - only managed connections
             disconnect_managed_only()
